@@ -3,11 +3,14 @@
 """
 import json
 import os
-from typing import List, Dict, Optional
+import math
+from typing import List, Dict, Optional, Tuple
 from logger import setup_logger
 
 logger = setup_logger("index_manager")
 INDEX_FILE = "document_index.json"
+THRESHOLD_FILE = "search_threshold.json"
+DEFAULT_THRESHOLD = 0.5  # Порог по умолчанию
 
 
 def save_index(documents: List[Dict], index_path: str = INDEX_FILE) -> None:
@@ -104,4 +107,177 @@ def get_index_stats(index_path: str = INDEX_FILE) -> Dict:
     
     logger.info(f"Статистика индекса: {stats['total_chunks']} чанков, {stats['unique_documents']} документов")
     return stats
+
+
+def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    """
+    Вычисляет косинусное сходство между двумя векторами
+    
+    Args:
+        vec1: Первый вектор
+        vec2: Второй вектор
+        
+    Returns:
+        Косинусное сходство (от -1 до 1)
+    """
+    if len(vec1) != len(vec2):
+        logger.warning(f"Размерности векторов не совпадают: {len(vec1)} != {len(vec2)}")
+        return 0.0
+    
+    dot_product = sum(a * b for a, b in zip(vec1, vec2))
+    magnitude1 = math.sqrt(sum(a * a for a in vec1))
+    magnitude2 = math.sqrt(sum(a * a for a in vec2))
+    
+    if magnitude1 == 0 or magnitude2 == 0:
+        return 0.0
+    
+    return dot_product / (magnitude1 * magnitude2)
+
+
+def save_threshold(threshold: float, threshold_path: str = THRESHOLD_FILE) -> None:
+    """
+    Сохраняет порог фильтрации в файл
+    
+    Args:
+        threshold: Значение порога (от 0.0 до 1.0)
+        threshold_path: Путь к файлу с порогом
+    """
+    try:
+        with open(threshold_path, 'w', encoding='utf-8') as f:
+            json.dump({"threshold": threshold}, f, indent=2)
+        logger.info(f"Порог фильтрации сохранен: {threshold}")
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении порога: {e}", exc_info=True)
+
+
+def load_threshold(threshold_path: str = THRESHOLD_FILE) -> float:
+    """
+    Загружает порог фильтрации из файла
+    
+    Args:
+        threshold_path: Путь к файлу с порогом
+        
+    Returns:
+        Значение порога или значение по умолчанию
+    """
+    if not os.path.exists(threshold_path):
+        logger.info(f"Файл с порогом не найден, используется значение по умолчанию: {DEFAULT_THRESHOLD}")
+        return DEFAULT_THRESHOLD
+    
+    try:
+        with open(threshold_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            threshold = data.get("threshold", DEFAULT_THRESHOLD)
+            logger.info(f"Порог фильтрации загружен: {threshold}")
+            return threshold
+    except Exception as e:
+        logger.warning(f"Ошибка при загрузке порога, используется значение по умолчанию: {e}")
+        return DEFAULT_THRESHOLD
+
+
+def search_relevant_chunks(
+    query_embedding: List[float],
+    index_path: str = INDEX_FILE,
+    top_k: int = 5,
+    min_similarity: Optional[float] = None
+) -> List[Tuple[Dict, float]]:
+    """
+    Ищет наиболее релевантные чанки по запросу
+    
+    Args:
+        query_embedding: Эмбеддинг запроса
+        index_path: Путь к файлу индекса
+        top_k: Количество наиболее релевантных чанков для возврата
+        min_similarity: Минимальное значение косинусного сходства (если None, используется сохраненный порог)
+        
+    Returns:
+        Список кортежей (чанк, similarity_score), отсортированный по убыванию сходства
+    """
+    results, _ = search_relevant_chunks_with_stats(
+        query_embedding, index_path, top_k, min_similarity
+    )
+    return results
+
+
+def search_relevant_chunks_with_stats(
+    query_embedding: List[float],
+    index_path: str = INDEX_FILE,
+    top_k: int = 5,
+    min_similarity: Optional[float] = None
+) -> Tuple[List[Tuple[Dict, float]], Dict]:
+    """
+    Ищет наиболее релевантные чанки по запросу и возвращает статистику
+    
+    Args:
+        query_embedding: Эмбеддинг запроса
+        index_path: Путь к файлу индекса
+        top_k: Количество наиболее релевантных чанков для возврата
+        min_similarity: Минимальное значение косинусного сходства (если None, используется сохраненный порог)
+        
+    Returns:
+        Кортеж (список результатов, словарь со статистикой)
+    """
+    # Используем сохраненный порог, если min_similarity не указан
+    if min_similarity is None:
+        min_similarity = load_threshold()
+    
+    logger.info(f"Поиск релевантных чанков (top_k={top_k}, min_similarity={min_similarity})")
+    
+    documents = load_index(index_path)
+    if documents is None:
+        logger.warning("Индекс не найден для поиска")
+        return [], {}
+    
+    if not documents:
+        logger.warning("Индекс пуст")
+        return [], {}
+    
+    # Вычисляем сходство для каждого чанка
+    all_similarities = []
+    filtered_similarities = []
+    
+    for doc in documents:
+        if 'embedding' not in doc:
+            logger.warning(f"Чанк {doc.get('chunk_id', 'unknown')} не имеет эмбеддинга")
+            continue
+        
+        embedding = doc['embedding']
+        similarity = cosine_similarity(query_embedding, embedding)
+        all_similarities.append((doc, similarity))
+        
+        if similarity >= min_similarity:
+            filtered_similarities.append((doc, similarity))
+    
+    # Сортируем по убыванию сходства
+    all_similarities.sort(key=lambda x: x[1], reverse=True)
+    filtered_similarities.sort(key=lambda x: x[1], reverse=True)
+    
+    # Возвращаем топ-K отфильтрованных результатов
+    top_results = filtered_similarities[:top_k]
+    
+    # Статистика
+    total_checked = len(all_similarities)
+    total_filtered = len(filtered_similarities)
+    total_rejected = total_checked - total_filtered
+    
+    stats = {
+        "total_checked": total_checked,
+        "total_filtered": total_filtered,
+        "total_rejected": total_rejected,
+        "min_similarity": min_similarity,
+        "best_similarity": all_similarities[0][1] if all_similarities else 0.0,
+        "best_filtered_similarity": top_results[0][1] if top_results else 0.0,
+        "all_top_results": all_similarities[:top_k] if all_similarities else []
+    }
+    
+    logger.info(
+        f"Найдено {len(top_results)} релевантных чанков из {total_checked} "
+        f"(отфильтровано: {total_rejected}, прошло фильтр: {total_filtered})"
+    )
+    if top_results:
+        logger.info(f"Лучшее сходство (с фильтром): {top_results[0][1]:.4f}")
+    if all_similarities:
+        logger.info(f"Максимальное сходство (без фильтра): {all_similarities[0][1]:.4f}")
+    
+    return top_results, stats
 
