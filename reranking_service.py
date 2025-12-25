@@ -1,21 +1,204 @@
 """
 Модуль для реранкинга результатов поиска через LLM
 """
+import os
 import requests
 import re
 import json
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Literal
 from logger import setup_logger
 
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
 logger = setup_logger("reranking_service")
-LLM_HOST = "http://localhost:7999"
-LLM_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+
+# Конфигурация для локальной LLM
+LLM_HOST = os.getenv("LOCAL_LLM_HOST", "http://localhost:7999")
+LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
+
+# Конфигурация для DeepSeek через Hugging Face
+HF_TOKEN = os.getenv("HF_TOKEN")
+DEEPSEEK_MODEL = "deepseek-ai/DeepSeek-V3.2:novita"
+HF_BASE_URL = "https://router.huggingface.co/v1"
+
+# Провайдер по умолчанию
+DEFAULT_PROVIDER = os.getenv("RERANK_PROVIDER", "local")  # "local" или "deepseek"
+
+
+def _rerank_with_local_llm(
+    query: str,
+    chunks: List[Tuple[Dict, float]],
+    system_prompt: str,
+    user_prompt: str
+) -> str:
+    """
+    Выполняет реранкинг через локальную LLM
+    
+    Returns:
+        Ответ от LLM с номерами релевантных чанков
+    """
+    url = f"{LLM_HOST}/v1/chat/completions"
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": user_prompt
+            }
+        ],
+        "temperature": 0.3,
+        "max_tokens": 50
+    }
+    
+    logger.info(f"Отправка запроса на реранкинг в локальную LLM: {url}")
+    
+    # Логируем тело запроса
+    logger.info("=" * 60)
+    logger.info("ЗАПРОС К ЛОКАЛЬНОЙ LLM (REQUEST BODY):")
+    logger.info("=" * 60)
+    try:
+        log_payload = payload.copy()
+        if 'messages' in log_payload:
+            for msg in log_payload['messages']:
+                content = msg.get('content', '')
+                if len(content) > 1000:
+                    msg['content'] = content[:1000] + f"\n... [обрезано, всего {len(content)} символов]"
+        logger.info(json.dumps(log_payload, ensure_ascii=False, indent=2))
+    except Exception as e:
+        logger.warning(f"Не удалось отформатировать payload для логирования: {e}")
+        logger.info(f"Payload (raw): {payload}")
+    logger.info("=" * 60)
+    
+    logger.info("Ожидание ответа от локальной LLM (может занять до 5 минут)...")
+    
+    response = requests.post(url, json=payload, timeout=360)
+    response.raise_for_status()
+    
+    # Логируем тело ответа
+    logger.info("=" * 60)
+    logger.info("ОТВЕТ ОТ ЛОКАЛЬНОЙ LLM (RESPONSE BODY):")
+    logger.info("=" * 60)
+    
+    try:
+        data = response.json()
+    except json.JSONDecodeError as e:
+        logger.error(f"Ответ не является валидным JSON: {e}")
+        logger.info(f"Статус код: {response.status_code}")
+        logger.info(f"Тело ответа (raw): {response.text[:2000]}...")
+        logger.info("=" * 60)
+        raise
+    
+    try:
+        logger.info(f"Статус код: {response.status_code}")
+        logger.info(f"Заголовки ответа: {dict(response.headers)}")
+        logger.info("Тело ответа (JSON):")
+        logger.info(json.dumps(data, ensure_ascii=False, indent=2))
+    except Exception as e:
+        logger.warning(f"Не удалось залогировать ответ: {e}")
+        logger.info(f"Response data (raw): {data}")
+    
+    logger.info("=" * 60)
+    
+    if 'choices' in data and len(data['choices']) > 0:
+        content = data['choices'][0]['message']['content'].strip()
+        logger.info(f"Получен ответ от локальной LLM: {content}")
+        return content
+    else:
+        logger.error("Неожиданная структура ответа от локальной LLM")
+        raise ValueError("Неожиданная структура ответа от локальной LLM")
+
+
+def _rerank_with_deepseek(
+    query: str,
+    chunks: List[Tuple[Dict, float]],
+    system_prompt: str,
+    user_prompt: str
+) -> str:
+    """
+    Выполняет реранкинг через DeepSeek-V3.2 через Hugging Face API
+    
+    Returns:
+        Ответ от LLM с номерами релевантных чанков
+    """
+    if OpenAI is None:
+        raise ImportError("openai библиотека не установлена. Установите её: pip install openai")
+    
+    if not HF_TOKEN:
+        raise ValueError("HF_TOKEN не установлен. Установите переменную окружения HF_TOKEN")
+    
+    client = OpenAI(
+        base_url=HF_BASE_URL,
+        api_key=HF_TOKEN,
+    )
+    
+    logger.info(f"Отправка запроса на реранкинг в DeepSeek через Hugging Face API")
+    logger.info(f"Модель: {DEEPSEEK_MODEL}")
+    
+    # Логируем тело запроса
+    logger.info("=" * 60)
+    logger.info("ЗАПРОС К DEEPSEEK (REQUEST BODY):")
+    logger.info("=" * 60)
+    try:
+        log_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        for msg in log_messages:
+            content = msg.get('content', '')
+            if len(content) > 1000:
+                msg['content'] = content[:1000] + f"\n... [обрезано, всего {len(content)} символов]"
+        logger.info(json.dumps({"model": DEEPSEEK_MODEL, "messages": log_messages}, ensure_ascii=False, indent=2))
+    except Exception as e:
+        logger.warning(f"Не удалось отформатировать payload для логирования: {e}")
+    logger.info("=" * 60)
+    
+    logger.info("Ожидание ответа от DeepSeek...")
+    
+    try:
+        completion = client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt
+                }
+            ],
+            temperature=0.3,
+            max_tokens=50
+        )
+        
+        content = completion.choices[0].message.content.strip()
+        
+        # Логируем ответ
+        logger.info("=" * 60)
+        logger.info("ОТВЕТ ОТ DEEPSEEK:")
+        logger.info("=" * 60)
+        logger.info(f"Получен ответ от DeepSeek: {content}")
+        logger.info("=" * 60)
+        
+        return content
+        
+    except Exception as e:
+        logger.error(f"Ошибка при запросе к DeepSeek: {e}", exc_info=True)
+        raise
 
 
 def rerank_chunks(
     query: str,
     chunks: List[Tuple[Dict, float]],
-    max_chunks: Optional[int] = None
+    max_chunks: Optional[int] = None,
+    provider: Optional[Literal["local", "deepseek"]] = None
 ) -> List[Tuple[Dict, float]]:
     """
     Отправляет изначальный вопрос и найденные чанки в LLM для фильтрации релевантных.
@@ -24,6 +207,7 @@ def rerank_chunks(
         query: Изначальный вопрос пользователя
         chunks: Список кортежей (чанк, similarity_score) - результаты поиска
         max_chunks: Максимальное количество чанков для возврата (если None, возвращает все отфильтрованные)
+        provider: Провайдер для реранкинга ("local" или "deepseek"). Если None, используется DEFAULT_PROVIDER
     
     Returns:
         Список отфильтрованных чанков в том же формате (чанк, similarity_score)
@@ -32,9 +216,19 @@ def rerank_chunks(
         logger.info("Нет чанков для реранкинга")
         return []
     
+    # Определяем провайдера
+    if provider is None:
+        provider = DEFAULT_PROVIDER
+    
+    if provider not in ["local", "deepseek"]:
+        logger.warning(f"Неизвестный провайдер: {provider}, используем 'local'")
+        provider = "local"
+    
+    logger.info(f"Используется провайдер реранкинга: {provider}")
+    
     # Логируем чанки до реранкинга
     logger.info(f"=" * 60)
-    logger.info(f"РЕРАНКИНГ: Начало обработки {len(chunks)} чанков")
+    logger.info(f"РЕРАНКИНГ: Начало обработки {len(chunks)} чанков (провайдер: {provider})")
     logger.info(f"=" * 60)
     logger.info("Чанки ДО реранкинга:")
     for idx, (chunk, similarity) in enumerate(chunks, 1):
@@ -69,85 +263,13 @@ Below are the found document fragments (chunks):
 
 Analyze each chunk and identify which ones truly answer the user's question or contain relevant information."""
         
-        # Отправляем запрос в LLM
-        url = f"{LLM_HOST}/v1/chat/completions"
-        payload = {
-            "model": LLM_MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt
-                }
-            ],
-            "temperature": 0.3,  # Низкая температура для более детерминированного ответа
-            "max_tokens": 50
-        }
-        
-        logger.info(f"Отправка запроса на реранкинг в LLM: {url}")
         logger.info(f"Количество чанков для фильтрации: {len(chunks)}")
         
-        # Логируем тело запроса
-        logger.info("=" * 60)
-        logger.info("ЗАПРОС К LLM (REQUEST BODY):")
-        logger.info("=" * 60)
-        try:
-            # Форматируем payload для логирования (укорачиваем длинные промпты)
-            log_payload = payload.copy()
-            if 'messages' in log_payload:
-                for msg in log_payload['messages']:
-                    content = msg.get('content', '')
-                    if len(content) > 1000:
-                        msg['content'] = content[:1000] + f"\n... [обрезано, всего {len(content)} символов]"
-            logger.info(json.dumps(log_payload, ensure_ascii=False, indent=2))
-        except Exception as e:
-            logger.warning(f"Не удалось отформатировать payload для логирования: {e}")
-            logger.info(f"Payload (raw): {payload}")
-        logger.info("=" * 60)
-        
-        logger.info("Ожидание ответа от LLM (может занять до 5 минут для медленных моделей)...")
-        
-        # Таймаут увеличен до 6 минут для медленных моделей
-        response = requests.post(url, json=payload, timeout=360)
-        response.raise_for_status()
-        
-        # Логируем тело ответа
-        logger.info("=" * 60)
-        logger.info("ОТВЕТ ОТ LLM (RESPONSE BODY):")
-        logger.info("=" * 60)
-        
-        # Парсим JSON ответа
-        try:
-            data = response.json()
-        except json.JSONDecodeError as e:
-            logger.error(f"Ответ не является валидным JSON: {e}")
-            logger.info(f"Статус код: {response.status_code}")
-            logger.info(f"Тело ответа (raw): {response.text[:2000]}...")
-            logger.info("=" * 60)
-            return chunks  # Возвращаем все чанки при ошибке парсинга
-        
-        # Логируем распарсенный ответ
-        try:
-            logger.info(f"Статус код: {response.status_code}")
-            logger.info(f"Заголовки ответа: {dict(response.headers)}")
-            logger.info("Тело ответа (JSON):")
-            logger.info(json.dumps(data, ensure_ascii=False, indent=2))
-        except Exception as e:
-            logger.warning(f"Не удалось залогировать ответ: {e}")
-            logger.info(f"Response data (raw): {data}")
-        
-        logger.info("=" * 60)
-        
-        # Извлекаем ответ из структуры ответа
-        if 'choices' in data and len(data['choices']) > 0:
-            content = data['choices'][0]['message']['content'].strip()
-            logger.info(f"Получен ответ от LLM: {content}")
-        else:
-            logger.error("Неожиданная структура ответа от LLM")
-            return chunks  # Возвращаем все чанки, если не удалось распарсить ответ
+        # Вызываем соответствующий провайдер
+        if provider == "deepseek":
+            content = _rerank_with_deepseek(query, chunks, system_prompt, user_prompt)
+        else:  # provider == "local"
+            content = _rerank_with_local_llm(query, chunks, system_prompt, user_prompt)
         
         # Парсим ответ - извлекаем номера чанков
         try:
@@ -233,8 +355,6 @@ Analyze each chunk and identify which ones truly answer the user's question or c
         return chunks  # Возвращаем все чанки при таймауте
     except requests.exceptions.HTTPError as e:
         logger.error(f"HTTP ошибка при запросе к LLM для реранкинга: {e}")
-        if 'response' in locals():
-            logger.error(f"Ответ сервера: {response.text}")
         logger.info("=" * 60)
         logger.info("РЕРАНКИНГ: HTTP ошибка, возвращаем все чанки без изменений")
         logger.info(f"  До реранкинга: {len(chunks)} чанков")
@@ -249,6 +369,14 @@ Analyze each chunk and identify which ones truly answer the user's question or c
         logger.info(f"  После реранкинга: {len(chunks)} чанков (без изменений)")
         logger.info("=" * 60)
         return chunks  # Возвращаем все чанки при ошибке
+    except (ImportError, ValueError) as e:
+        logger.error(f"Ошибка конфигурации провайдера {provider}: {e}", exc_info=True)
+        logger.info("=" * 60)
+        logger.info("РЕРАНКИНГ: Ошибка конфигурации, возвращаем все чанки без изменений")
+        logger.info(f"  До реранкинга: {len(chunks)} чанков")
+        logger.info(f"  После реранкинга: {len(chunks)} чанков (без изменений)")
+        logger.info("=" * 60)
+        return chunks  # Возвращаем все чанки при ошибке конфигурации
     except Exception as e:
         logger.error(f"Неожиданная ошибка при реранкинге: {e}", exc_info=True)
         logger.info("=" * 60)
