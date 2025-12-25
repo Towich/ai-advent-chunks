@@ -127,8 +127,8 @@ def split_text_into_chunks_streaming(
 
 def process_documents_from_folder(
     folder_path: str = "./docs",
-    chunk_size: int = 200,
-    overlap: int = 20,
+    chunk_size: int = 500,
+    overlap: int = 50,
     pages_per_batch: int = 5
 ) -> List[Dict]:
     """

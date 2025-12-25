@@ -20,6 +20,9 @@ def setup_logger(name: str = "indexing", log_file: str = "indexing.log") -> logg
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
     
+    # Отключаем распространение к root logger, чтобы избежать двойного логирования
+    logger.propagate = False
+    
     # Удаляем существующие обработчики, если есть
     logger.handlers = []
     
