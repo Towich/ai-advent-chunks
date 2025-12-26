@@ -28,7 +28,7 @@ async def search_documents(
     min_similarity: Optional[float] = None
 ) -> Dict[str, Any]:
     """
-    Ищет релевантные документы по текстовому запросу.
+    Ищет релевантные документы по текстовому запросу. Использует RAG-систему поиска
     
     Args:
         query: Текстовый запрос для поиска

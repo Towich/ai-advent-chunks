@@ -530,3 +530,180 @@ def process_documents_from_folder(
     logger.info(f"Обработка завершена. Всего создано {len(documents)} чанков из {total_files} файлов ({len(pdf_files)} PDF, {len(md_files)} MD)")
     return documents
 
+
+def process_android_project(
+    project_path: str,
+    chunk_size: int = 1000,
+    overlap: int = 200
+) -> List[Dict]:
+    """
+    Обрабатывает Android-проект и возвращает чанки с метаданными
+    
+    Args:
+        project_path: Путь к корневой папке Android-проекта
+        chunk_size: Размер чанка в символах
+        overlap: Размер перекрытия между чанками
+        
+    Returns:
+        Список словарей с чанками и метаданными
+    """
+    logger.info(f"Начало обработки Android-проекта: {project_path}")
+    logger.info(f"Параметры: chunk_size={chunk_size}, overlap={overlap}")
+    
+    if not os.path.exists(project_path):
+        logger.error(f"Путь к проекту не существует: {project_path}")
+        return []
+    
+    if not os.path.isdir(project_path):
+        logger.error(f"Указанный путь не является папкой: {project_path}")
+        return []
+    
+    # Расширения файлов для обработки
+    relevant_extensions = {
+        '.java', '.kt', '.kts',  # Java/Kotlin код
+        '.xml',  # XML файлы (манифесты, layouts, ресурсы)
+        '.gradle',  # Gradle файлы
+        '.properties',  # Properties файлы
+        '.pro',  # ProGuard правила
+        '.aidl',  # Android Interface Definition Language
+        '.rs', '.rsh',  # Renderscript
+        '.mk',  # Makefile для NDK
+        '.sh',  # Shell скрипты
+        '.md',  # Markdown документация
+        '.txt',  # Текстовые файлы
+    }
+    
+    # Папки и файлы для игнорирования
+    ignored_patterns = {
+        'build', '.gradle', '.idea', '.git', 'node_modules',
+        '.DS_Store', 'local.properties', '.gradle-wrapper',
+        'gradlew', 'gradlew.bat', '.externalNativeBuild',
+        '.cxx', 'app/build', 'app/.cxx', 'app/.externalNativeBuild'
+    }
+    
+    documents = []
+    processed_files = []
+    
+    # Получаем абсолютный путь для корректного вычисления относительных путей
+    project_path = os.path.abspath(project_path)
+    
+    logger.info(f"Сканирование Android-проекта: {project_path}")
+    
+    # Рекурсивно обходим все файлы в проекте
+    for root, dirs, files in os.walk(project_path):
+        # Исключаем игнорируемые папки из дальнейшего обхода
+        dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.startswith('.')]
+        
+        for filename in files:
+            file_path = os.path.join(root, filename)
+            
+            # Пропускаем игнорируемые файлы
+            if filename in ignored_patterns or filename.startswith('.'):
+                continue
+            
+            # Проверяем расширение файла
+            _, ext = os.path.splitext(filename)
+            if ext.lower() not in relevant_extensions:
+                continue
+            
+            # Пропускаем если путь содержит игнорируемые папки
+            relative_path = os.path.relpath(file_path, project_path)
+            path_parts = relative_path.split(os.sep)
+            if any(part in ignored_patterns for part in path_parts):
+                continue
+            
+            processed_files.append(relative_path)
+            
+            try:
+                # Пытаемся прочитать файл как текст
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                except UnicodeDecodeError:
+                    # Если не UTF-8, пробуем другие кодировки
+                    try:
+                        with open(file_path, 'r', encoding='latin-1') as f:
+                            content = f.read()
+                        logger.warning(f"Файл {relative_path} прочитан с кодировкой latin-1")
+                    except Exception as e:
+                        logger.warning(f"Не удалось прочитать файл {relative_path}: {e}")
+                        continue
+                
+                if not content.strip():
+                    logger.debug(f"Пропущен пустой файл: {relative_path}")
+                    continue
+                
+                # Определяем тип файла для контекста
+                file_type = "unknown"
+                if ext == '.java':
+                    file_type = "Java"
+                elif ext == '.kt' or ext == '.kts':
+                    file_type = "Kotlin"
+                elif ext == '.xml':
+                    file_type = "XML"
+                elif ext == '.gradle':
+                    file_type = "Gradle"
+                elif ext == '.properties':
+                    file_type = "Properties"
+                elif ext == '.md':
+                    file_type = "Markdown"
+                
+                # Для XML и Markdown используем умное разбиение по структуре
+                num_chunks = 0
+                if ext == '.xml' or ext == '.md':
+                    if ext == '.md':
+                        markdown_chunks = split_markdown_by_headers(content, chunk_size, overlap)
+                        num_chunks = len(markdown_chunks)
+                        for chunk_idx, chunk_data in enumerate(markdown_chunks):
+                            chunk_text = chunk_data['text']
+                            header_context = chunk_data.get('header_context', '')
+                            
+                            # Формируем текст чанка с контекстом
+                            chunk_with_context = f"Файл: {relative_path}\nТип: {file_type}\n"
+                            if header_context:
+                                chunk_with_context += f"Контекст: {header_context}\n"
+                            chunk_with_context += f"\n{chunk_text}"
+                            
+                            documents.append({
+                                'document': relative_path,
+                                'chunk_id': chunk_idx,
+                                'text': chunk_with_context,
+                                'file_type': file_type,
+                                'total_chunks': num_chunks
+                            })
+                    else:
+                        # Для XML файлов используем простое разбиение
+                        chunks, _ = split_text_into_chunks_streaming(content, chunk_size, overlap)
+                        num_chunks = len(chunks)
+                        for chunk_idx, chunk_text in enumerate(chunks):
+                            chunk_with_context = f"Файл: {relative_path}\nТип: {file_type}\n\n{chunk_text}"
+                            documents.append({
+                                'document': relative_path,
+                                'chunk_id': chunk_idx,
+                                'text': chunk_with_context,
+                                'file_type': file_type,
+                                'total_chunks': num_chunks
+                            })
+                else:
+                    # Для остальных файлов (Java, Kotlin, Gradle и т.д.) используем простое разбиение
+                    chunks, _ = split_text_into_chunks_streaming(content, chunk_size, overlap)
+                    num_chunks = len(chunks)
+                    for chunk_idx, chunk_text in enumerate(chunks):
+                        chunk_with_context = f"Файл: {relative_path}\nТип: {file_type}\n\n{chunk_text}"
+                        documents.append({
+                            'document': relative_path,
+                            'chunk_id': chunk_idx,
+                            'text': chunk_with_context,
+                            'file_type': file_type,
+                            'total_chunks': num_chunks
+                        })
+                
+                logger.debug(f"Обработан файл: {relative_path} ({num_chunks} чанков)")
+                
+            except Exception as e:
+                logger.error(f"Ошибка при обработке файла {relative_path}: {e}", exc_info=True)
+    
+    logger.info(f"Обработка Android-проекта завершена. Обработано {len(processed_files)} файлов, создано {len(documents)} чанков")
+    
+    return documents
+
